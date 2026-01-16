@@ -54,7 +54,7 @@ def init_db():
     # CRIAR O USUÁRIO ADMIN PADRÃO (Se não existir)
     c.execute('SELECT count(*) FROM users WHERE matricula = "admin"')
     if c.fetchone()[0] == 0:
-        admin_pass = hashlib.sha256(str.encode("admin123")).hexdigest()
+        admin_pass = hashlib.sha256(str.encode("admin7885")).hexdigest()
         c.execute('''
             INSERT INTO users (matricula, password, name, is_admin, approved) 
             VALUES (?, ?, ?, ?, ?)
@@ -297,3 +297,4 @@ else:
         conn.close()
         for mb in my_books:
             st.text(f"{mb[0]} | {mb[1]} até {mb[2]}")
+
