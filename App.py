@@ -4,22 +4,23 @@ import datetime
 import hashlib
 from time import sleep
 
-# --- CONFIGURAÇÃO INICIAL DA PÁGINA ---
-st.set_page_config(page_title="Lab Manager SaaS", layout="wide")
+# --- CONFIGURAÇÃO DA PÁGINA ---
+st.set_page_config(page_title="Lab Manager Pro", layout="wide")
 
-# --- BANCO DE DADOS (SQLite) ---
+# --- BANCO DE DADOS ---
 def init_db():
-    """Cria as tabelas e computadores se não existirem."""
     conn = sqlite3.connect('laboratorio.db')
     c = conn.cursor()
     
-    # 1. Tabela de Usuários
+    # 1. Tabela de Usuários (Com campo de admin e aprovação)
     c.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             matricula TEXT UNIQUE NOT NULL,
             password TEXT NOT NULL,
-            name TEXT
+            name TEXT,
+            is_admin BOOLEAN DEFAULT 0,
+            approved BOOLEAN DEFAULT 0
         )
     ''')
     
@@ -44,19 +45,27 @@ def init_db():
         )
     ''')
     
-    # Criar 10 computadores automaticamente se a tabela estiver vazia
+    # Criar 3 computadores se não existirem
     c.execute('SELECT count(*) FROM computers')
     if c.fetchone()[0] == 0:
-        for i in range(1, 4):  # <--- MUDANÇA AQUI (de 11 para 4)
+        for i in range(1, 4):
             c.execute('INSERT INTO computers (name) VALUES (?)', (f'PC-{i:02d}',))
-            
+    
+    # CRIAR O USUÁRIO ADMIN PADRÃO (Se não existir)
+    c.execute('SELECT count(*) FROM users WHERE matricula = "admin"')
+    if c.fetchone()[0] == 0:
+        admin_pass = hashlib.sha256(str.encode("admin123")).hexdigest()
+        c.execute('''
+            INSERT INTO users (matricula, password, name, is_admin, approved) 
+            VALUES (?, ?, ?, ?, ?)
+        ''', ("admin", admin_pass, "Administrador", 1, 1))
+
     conn.commit()
     conn.close()
 
-# Inicializa o banco ao abrir o app
 init_db()
 
-# --- FUNÇÕES DE SEGURANÇA E LÓGICA ---
+# --- FUNÇÕES DE LÓGICA ---
 def make_hash(password):
     return hashlib.sha256(str.encode(password)).hexdigest()
 
@@ -64,7 +73,8 @@ def check_login(matricula, password):
     conn = sqlite3.connect('laboratorio.db')
     c = conn.cursor()
     pwd_hash = make_hash(password)
-    c.execute('SELECT id, name FROM users WHERE matricula = ? AND password = ?', (matricula, pwd_hash))
+    # Busca usuário, se é admin e se está aprovado
+    c.execute('SELECT id, name, is_admin, approved FROM users WHERE matricula = ? AND password = ?', (matricula, pwd_hash))
     data = c.fetchone()
     conn.close()
     return data
@@ -73,7 +83,8 @@ def create_user(matricula, password, name):
     conn = sqlite3.connect('laboratorio.db')
     c = conn.cursor()
     try:
-        c.execute('INSERT INTO users (matricula, password, name) VALUES (?, ?, ?)', 
+        # Cria usuário comum (is_admin=0, approved=0)
+        c.execute('INSERT INTO users (matricula, password, name, is_admin, approved) VALUES (?, ?, ?, 0, 0)', 
                   (matricula, make_hash(password), name))
         conn.commit()
         return True
@@ -83,19 +94,9 @@ def create_user(matricula, password, name):
         conn.close()
 
 def check_availability(computer_id, start_dt, end_dt):
-    """
-    A LÓGICA DE OURO: Verifica se existe sobreposição de horários.
-    Retorna True se estiver livre, False se estiver ocupado.
-    """
     conn = sqlite3.connect('laboratorio.db')
     c = conn.cursor()
-    
-    query = """
-        SELECT count(*) FROM bookings 
-        WHERE computer_id = ? 
-        AND ( ? < end_time AND ? > start_time )
-    """
-    c.execute(query, (computer_id, start_dt, end_dt))
+    c.execute("SELECT count(*) FROM bookings WHERE computer_id = ? AND (? < end_time AND ? > start_time)", (computer_id, start_dt, end_dt))
     count = c.fetchone()[0]
     conn.close()
     return count == 0
@@ -103,143 +104,196 @@ def check_availability(computer_id, start_dt, end_dt):
 def add_booking(user_id, computer_id, start_dt, end_dt):
     conn = sqlite3.connect('laboratorio.db')
     c = conn.cursor()
-    c.execute('INSERT INTO bookings (user_id, computer_id, start_time, end_time) VALUES (?, ?, ?, ?)',
-              (user_id, computer_id, start_dt, end_dt))
+    c.execute('INSERT INTO bookings (user_id, computer_id, start_time, end_time) VALUES (?, ?, ?, ?)', (user_id, computer_id, start_dt, end_dt))
     conn.commit()
     conn.close()
 
-# --- INTERFACE DO USUÁRIO (FRONTEND) ---
+# --- FUNÇÕES EXCLUSIVAS DO ADMIN ---
+def get_all_users():
+    conn = sqlite3.connect('laboratorio.db')
+    # Pega todos menos o admin
+    users = conn.cursor().execute('SELECT id, matricula, name, approved FROM users WHERE matricula != "admin"').fetchall()
+    conn.close()
+    return users
 
-# Gerenciamento de Sessão (Login)
+def approve_user(user_id):
+    conn = sqlite3.connect('laboratorio.db')
+    conn.cursor().execute('UPDATE users SET approved = 1 WHERE id = ?', (user_id,))
+    conn.commit()
+    conn.close()
+
+def delete_user(user_id):
+    conn = sqlite3.connect('laboratorio.db')
+    conn.cursor().execute('DELETE FROM users WHERE id = ?', (user_id,))
+    conn.commit()
+    conn.close()
+
+def get_all_bookings_admin():
+    conn = sqlite3.connect('laboratorio.db')
+    query = '''
+        SELECT b.id, u.name, u.matricula, c.name, b.start_time, b.end_time 
+        FROM bookings b
+        JOIN users u ON b.user_id = u.id
+        JOIN computers c ON b.computer_id = c.id
+        ORDER BY b.start_time DESC
+    '''
+    data = conn.cursor().execute(query).fetchall()
+    conn.close()
+    return data
+
+# --- INTERFACE ---
+
 if 'logged_in' not in st.session_state:
     st.session_state['logged_in'] = False
-    st.session_state['user_name'] = ''
-    st.session_state['user_id'] = None
+    st.session_state['user_info'] = None # Guarda (id, nome, is_admin)
 
-# TELA 1: LOGIN E CADASTRO
+# TELA DE LOGIN / CADASTRO
 if not st.session_state['logged_in']:
-    col1, col2, col3 = st.columns([1,2,1])
+    st.title("🔒 Laboratório - Acesso Restrito")
     
-    with col2:
-        st.title("🔐 Acesso ao Laboratório")
-        tab1, tab2 = st.tabs(["Login", "Criar Conta"])
-        
-        with tab1:
-            matricula = st.text_input("Matrícula")
-            password = st.text_input("Senha", type="password")
-            if st.button("Entrar"):
-                user = check_login(matricula, password)
-                if user:
+    tab1, tab2 = st.tabs(["Fazer Login", "Solicitar Cadastro"])
+    
+    with tab1:
+        matricula = st.text_input("Matrícula")
+        password = st.text_input("Senha", type="password")
+        if st.button("Entrar"):
+            user = check_login(matricula, password)
+            if user:
+                user_id, user_name, is_admin, is_approved = user
+                
+                if is_approved:
                     st.session_state['logged_in'] = True
-                    st.session_state['user_id'] = user[0]
-                    st.session_state['user_name'] = user[1]
+                    st.session_state['user_info'] = {'id': user_id, 'name': user_name, 'is_admin': is_admin}
                     st.rerun()
                 else:
-                    st.error("Matrícula ou senha incorretos.")
-        
-        with tab2:
-            new_matricula = st.text_input("Nova Matrícula")
-            new_name = st.text_input("Seu Nome Completo")
-            new_pass = st.text_input("Criar Senha", type="password")
-            if st.button("Cadastrar"):
-                if create_user(new_matricula, new_pass, new_name):
-                    st.success("Conta criada! Vá para a aba de Login.")
-                else:
-                    st.error("Erro: Matrícula já cadastrada.")
+                    st.warning("⚠️ Seu cadastro foi recebido, mas ainda não foi aprovado pelo Admin.")
+            else:
+                st.error("Dados incorretos.")
 
-# TELA 2: SISTEMA PRINCIPAL (DASHBOARD)
+    with tab2:
+        st.write("Preencha seus dados. O Admin precisará aprovar antes de você acessar.")
+        new_mat = st.text_input("Sua Matrícula")
+        new_name = st.text_input("Nome Completo")
+        new_pass = st.text_input("Crie uma Senha", type="password")
+        if st.button("Enviar Solicitação"):
+            if create_user(new_mat, new_pass, new_name):
+                st.success("Solicitação enviada! Aguarde a aprovação do administrador.")
+            else:
+                st.error("Essa matrícula já possui cadastro.")
+
+# TELA LOGADA
 else:
-    # Barra Lateral
+    user = st.session_state['user_info']
+    
+    # BARRA LATERAL
     with st.sidebar:
-        st.write(f"Olá, **{st.session_state['user_name']}**")
-        st.write(f"Matrícula: {st.session_state['user_id']}")
+        st.title(f"Olá, {user['name']}")
+        st.caption(f"ID: {user['id']} | {'ADMIN' if user['is_admin'] else 'ALUNO'}")
+        
         if st.button("Sair"):
             st.session_state['logged_in'] = False
             st.rerun()
-    
-    st.title("🖥️ Gerenciamento de Laboratório")
-    
-    # Área de Nova Reserva
-    st.subheader("Nova Reserva")
-    
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        data_reserva = st.date_input("Data", datetime.date.today(), min_value=datetime.date.today())
-    with c2:
-        hora_inicio = st.time_input("Horário de Início", datetime.time(8, 0))
-    with c3:
-        horas_uso = st.number_input("Duração (Horas)", min_value=1, max_value=4, value=1)
-    
-    # Cálculo automático do fim
-    dt_inicio = datetime.datetime.combine(data_reserva, hora_inicio)
-    dt_fim = dt_inicio + datetime.timedelta(hours=horas_uso)
-    
-    with c4:
-        st.write("Horário Final:")
-        st.info(f"{dt_fim.strftime('%H:%M')}")
 
-    st.markdown("---")
-    
-    # MAPA VISUAL DOS COMPUTADORES
-    st.subheader("Escolha um Computador")
-    
-    # Buscar computadores no banco
-    conn = sqlite3.connect('laboratorio.db')
-    computers = conn.cursor().execute('SELECT id, name FROM computers').fetchall()
-    conn.close()
-    
-    # Criar um grid visual
-    cols = st.columns(3) # <--- MUDANÇA AQUI (de 5 para 3 colunas)
-    
-    for i, (comp_id, comp_name) in enumerate(computers):
-        # Para cada computador, verifica se está livre NAQUELA data/hora selecionada acima
-        is_free = check_availability(comp_id, dt_inicio, dt_fim)
+    # --- VISÃO DO ADMINISTRADOR ---
+    if user['is_admin']:
+        st.title("🛡️ Painel do Administrador")
         
-        with cols[i % 3]:
-            # Desenha o "Cartão" do computador
-            status_color = "green" if is_free else "red"
-            status_text = "LIVRE" if is_free else "OCUPADO"
+        admin_tab1, admin_tab2, admin_tab3 = st.tabs(["Gerenciar Usuários", "Histórico de Reservas", "Laboratório"])
+        
+        with admin_tab1:
+            st.subheader("Aprovações Pendentes e Usuários")
+            all_users = get_all_users()
             
-            st.markdown(f"""
-            <div style="
-                border: 2px solid {status_color};
-                border-radius: 10px;
-                padding: 10px;
-                text-align: center;
-                margin-bottom: 10px;">
-                <strong>{comp_name}</strong><br>
-                <span style="color: {status_color};">{status_text}</span>
-            </div>
-            """, unsafe_allow_html=True)
+            if not all_users:
+                st.info("Nenhum usuário cadastrado.")
             
-            # Botão de reservar (só aparece se estiver livre)
-            if is_free:
-                if st.button(f"Reservar {comp_name}", key=f"btn_{comp_id}"):
-                    add_booking(st.session_state['user_id'], comp_id, dt_inicio, dt_fim)
-                    st.success(f"Reserva feita para {comp_name}!")
-                    sleep(1)
-                    st.rerun() # Recarrega a página para atualizar o status
-            else:
-                st.button(f"Indisponível", disabled=True, key=f"btn_{comp_id}")
+            # Cabeçalho da tabela manual
+            c1, c2, c3, c4 = st.columns([2, 3, 2, 2])
+            c1.markdown("**Matrícula**")
+            c2.markdown("**Nome**")
+            c3.markdown("**Status**")
+            c4.markdown("**Ação**")
+            
+            for u_id, u_mat, u_name, u_approved in all_users:
+                c1, c2, c3, c4 = st.columns([2, 3, 2, 2])
+                c1.write(u_mat)
+                c2.write(u_name)
+                
+                if u_approved:
+                    c3.success("Ativo")
+                    if c4.button("Excluir", key=f"del_{u_id}"):
+                        delete_user(u_id)
+                        st.rerun()
+                else:
+                    c3.warning("Pendente")
+                    if c4.button("✅ Aprovar", key=f"app_{u_id}"):
+                        approve_user(u_id)
+                        st.success(f"{u_name} aprovado!")
+                        sleep(1)
+                        st.rerun()
+                st.markdown("---")
 
-    # EXIBIR MINHAS RESERVAS
-    st.markdown("---")
-    st.subheader("📅 Minhas Reservas Futuras")
-    
-    conn = sqlite3.connect('laboratorio.db')
-    minhas_reservas = conn.cursor().execute('''
-        SELECT c.name, b.start_time, b.end_time 
-        FROM bookings b
-        JOIN computers c ON b.computer_id = c.id
-        WHERE b.user_id = ? AND b.start_time >= ?
-        ORDER BY b.start_time
-    ''', (st.session_state['user_id'], datetime.datetime.now())).fetchall()
-    conn.close()
-    
-    if minhas_reservas:
-        for res in minhas_reservas:
-            start = datetime.datetime.strptime(res[1], '%Y-%m-%d %H:%M:%S')
-            end = datetime.datetime.strptime(res[2], '%Y-%m-%d %H:%M:%S')
-            st.info(f"🖥️ **{res[0]}** | 🗓️ {start.strftime('%d/%m/%Y')} | ⏰ {start.strftime('%H:%M')} às {end.strftime('%H:%M')}")
+        with admin_tab2:
+            st.subheader("Todas as Reservas")
+            bookings = get_all_bookings_admin()
+            if bookings:
+                # Mostrando em formato de tabela simples
+                data_clean = [{"Máquina": b[3], "Aluno": b[1], "Matrícula": b[2], "Início": b[4], "Fim": b[5]} for b in bookings]
+                st.table(data_clean)
+            else:
+                st.info("Nenhuma reserva feita ainda.")
+        
+        with admin_tab3:
+            st.subheader("Visão Geral das Máquinas")
+            # Reutilizando a lógica visual, mas apenas para visualização
+            st.write("Layout atual do laboratório (Apenas Visualização)")
+            conn = sqlite3.connect('laboratorio.db')
+            pcs = conn.cursor().execute('SELECT name FROM computers').fetchall()
+            conn.close()
+            st.write(f"Total de Máquinas: {len(pcs)}")
+            st.write([p[0] for p in pcs])
+
+    # --- VISÃO DO ALUNO (SISTEMA DE RESERVA) ---
     else:
-        st.write("Você não tem reservas futuras.")
+        st.title("📅 Reservar Computador")
+        
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            data_reserva = st.date_input("Data", datetime.date.today(), min_value=datetime.date.today())
+        with c2:
+            hora_inicio = st.time_input("Início", datetime.time(8, 0))
+        with c3:
+            horas_uso = st.number_input("Duração (h)", 1, 4, 1)
+        
+        dt_inicio = datetime.datetime.combine(data_reserva, hora_inicio)
+        dt_fim = dt_inicio + datetime.timedelta(hours=horas_uso)
+        
+        # Grid de Computadores (Igual ao anterior)
+        conn = sqlite3.connect('laboratorio.db')
+        computers = conn.cursor().execute('SELECT id, name FROM computers').fetchall()
+        conn.close()
+        
+        cols = st.columns(3)
+        for i, (comp_id, comp_name) in enumerate(computers):
+            is_free = check_availability(comp_id, dt_inicio, dt_fim)
+            with cols[i % 3]:
+                color = "green" if is_free else "#ff4b4b"
+                status = "LIVRE" if is_free else "OCUPADO"
+                st.markdown(f'<div style="border:2px solid {color};padding:10px;border-radius:5px;text-align:center"><b>{comp_name}</b><br><span style="color:{color}">{status}</span></div>', unsafe_allow_html=True)
+                
+                if is_free:
+                    if st.button("Reservar", key=f"btn_{comp_id}"):
+                        add_booking(user['id'], comp_id, dt_inicio, dt_fim)
+                        st.success("Reservado!")
+                        sleep(1)
+                        st.rerun()
+                else:
+                    st.button("Indisponível", key=f"btn_{comp_id}", disabled=True)
+
+        st.divider()
+        st.subheader("Minhas Reservas")
+        conn = sqlite3.connect('laboratorio.db')
+        my_books = conn.cursor().execute('SELECT c.name, b.start_time, b.end_time FROM bookings b JOIN computers c ON b.computer_id = c.id WHERE user_id = ?', (user['id'],)).fetchall()
+        conn.close()
+        for mb in my_books:
+            st.text(f"{mb[0]} | {mb[1]} até {mb[2]}")
